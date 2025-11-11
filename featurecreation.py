@@ -125,8 +125,10 @@ def extract_all_features(raw_email):
     features['is_mismatch'] = 1 if (get_domain(from_addr) and get_domain(reply_to) and get_domain(from_addr) != get_domain(reply_to)) else 0
     
     features['has_x_mailer'] = 1 if msg.get('X-Mailer') else 0
-    features['has_message_id'] = 1 if msg.get('Message-ID') else 0
-    
+    try:
+        features['has_message_id'] = 1 if msg.get('Message-ID') else 0
+    except Exception:
+        features['has_message_id'] = 0
     features['is_html'] = is_html
     features['link_count'] = body.count('http://') + body.count('https://') + body.count('href=')
     features['keyword_count'] = len(SPAM_REGEX.findall(body))
