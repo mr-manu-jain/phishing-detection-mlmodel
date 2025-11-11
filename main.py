@@ -5,12 +5,15 @@ import email
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
 from pydantic import BaseModel
 from email.policy import default
 from bs4 import BeautifulSoup # For parsing HTML
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import hstack, csr_matrix
 import warnings
+import os
 
 THRESHOLD = 0.75 #THRESHOLD FOR CLASSIFYING AS PHISHING
 
@@ -30,6 +33,45 @@ except FileNotFoundError:
     print("ERROR: Model or tool files not found.")
     print("Make sure all .joblib files are in the same directory.")
     model = None
+except Exception as e:
+    print(f"ERROR while loading artifacts: {e}")
+    model = None
+
+# Basic CORS (allow all by default; tighten in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Validate vectorizers are fitted (avoid opaque 500s)
+def _assert_fitted_vectorizers():
+    try:
+        for name, vec in {'subject': subject_vec, 'body': body_vec}.items():
+            # TfidfVectorizer exposes idf_ only after fit
+            if not hasattr(vec, 'idf_'):
+                raise RuntimeError(f"{name}_vectorizer is not fitted; re-export a fitted TfidfVectorizer")
+    except NameError:
+        # If subject_vec/body_vec are missing due to load failure
+        raise RuntimeError("Vectorizers not available; check artifact loading")
+
+# Health endpoints
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "phishing-detector", "version": "1.0"}
+
+@app.get("/healthz")
+async def healthz():
+    try:
+        _assert_fitted_vectorizers()
+        if model is None:
+            raise RuntimeError("Model not loaded")
+        return {"status": "healthy"}
+    except Exception as e:
+        # Return minimal detail to client; full detail in logs
+        return {"status": "unhealthy", "detail": str(e)}
 
 #Feature Engineering Pipeline
 def get_domain(email_address):
@@ -145,7 +187,11 @@ async def predict_phishing(email_input: EmailInput):
     Takes a raw email string and returns a phishing probability.
     """
     if not model:
-        return {"error": "Model not loaded. Please check server logs."}
+        raise HTTPException(status_code=503, detail="Model not loaded. Please check server logs and artifacts.")
+    try:
+        _assert_fitted_vectorizers()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Artifacts invalid: {e}")
 
     # 1. Get raw email from the request
     raw_email_text = email_input.raw_email
@@ -154,8 +200,9 @@ async def predict_phishing(email_input: EmailInput):
     features_df = extract_all_features(raw_email_text)
     
     # 3. Vectorize the text parts
-    subject_features = subject_vec.transform(features_df['subject'])
-    body_features = body_vec.transform(features_df['body'])
+    # Ensure inputs are iterable of strings
+    subject_features = subject_vec.transform(features_df['subject'].astype(str))
+    body_features = body_vec.transform(features_df['body'].astype(str))
     
     # 4. Get the heuristic parts
     # Ensure columns are in the *exact* same order as training
@@ -181,4 +228,5 @@ async def predict_phishing(email_input: EmailInput):
 if __name__ == "__main__":
     # This makes the script runnable with `python main.py`
     # For development, use: uvicorn main:app --reload
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
